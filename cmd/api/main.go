@@ -57,6 +57,8 @@ func main() {
 	customersHandler := &handlers.CustomersHandler{
 		DB: pool,
 	}
+	productsHandler := &handlers.ProductsHandler{DB: pool}
+	ordersHandler := &handlers.OrdersHandler{DB: pool}
 
 	router := gin.Default()
 
@@ -83,6 +85,15 @@ func main() {
 	protected.GET("/customers/:id", customersHandler.Get)
 	protected.PUT("/customers/:id", customersHandler.Update)
 	protected.DELETE("/customers/:id", customersHandler.Delete)
+	protected.POST("/products", productsHandler.Create)
+	protected.GET("/products", productsHandler.List)
+	protected.GET("/products/:id", productsHandler.Get)
+	protected.PUT("/products/:id", productsHandler.Update)
+	protected.DELETE("/products/:id", productsHandler.Delete)
+	protected.POST("/orders", ordersHandler.Create)
+	protected.GET("/orders", ordersHandler.List)
+	protected.GET("/orders/:id", ordersHandler.Get)
+	protected.PUT("/orders/:id/confirm", ordersHandler.Confirm)
 
 	log.Println("OrderDesk API starting on :8080")
 
