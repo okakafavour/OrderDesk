@@ -94,6 +94,7 @@ func main() {
 	protected.GET("/orders", ordersHandler.List)
 	protected.GET("/orders/:id", ordersHandler.Get)
 	protected.PUT("/orders/:id/confirm", ordersHandler.Confirm)
+	protected.PUT("/orders/:id/cancel", ordersHandler.Cancel)
 
 	log.Println("OrderDesk API starting on :8080")
 

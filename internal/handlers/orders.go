@@ -535,3 +535,194 @@ func (h *OrdersHandler) Get(c *gin.Context) {
 
 	c.JSON(http.StatusOK, order)
 }
+
+func (h *OrdersHandler) Cancel(c *gin.Context) {
+	ctx := c.Request.Context()
+	businessID := c.GetString("business_id")
+	orderID := c.Param("id")
+
+	if businessID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+		return
+	}
+
+	tx, err := h.DB.Begin(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not start cancellation transaction"})
+		return
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	// Lock the order so concurrent cancellation requests cannot restore stock twice.
+	var status string
+	err = tx.QueryRow(ctx, `
+		SELECT status
+		FROM orders
+		WHERE id = $1 AND business_id = $2
+		FOR UPDATE
+	`, orderID, businessID).Scan(&status)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "order not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load order"})
+		return
+	}
+
+	if status != "pending" && status != "confirmed" {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "only pending or confirmed orders can be cancelled",
+		})
+		return
+	}
+
+	// Only confirmed orders have had stock deducted.
+	if status == "confirmed" {
+		rows, err := tx.Query(ctx, `
+			SELECT product_id::text, SUM(quantity)::bigint
+			FROM order_items
+			WHERE order_id = $1
+			GROUP BY product_id
+			ORDER BY product_id
+		`, orderID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load order items"})
+			return
+		}
+
+		type stockItem struct {
+			productID string
+			quantity  int64
+		}
+
+		items := make([]stockItem, 0)
+		for rows.Next() {
+			var item stockItem
+			if err := rows.Scan(&item.productID, &item.quantity); err != nil {
+				rows.Close()
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read order items"})
+				return
+			}
+			items = append(items, item)
+		}
+
+		rowsErr := rows.Err()
+		rows.Close()
+		if rowsErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read order items"})
+			return
+		}
+		if len(items) == 0 {
+			c.JSON(http.StatusConflict, gin.H{"error": "order has no items"})
+			return
+		}
+
+		// Lock every product before restoring any stock.
+		for _, item := range items {
+			var productID string
+			err := tx.QueryRow(ctx, `
+				SELECT id::text
+				FROM products
+				WHERE id = $1 AND business_id = $2
+				FOR UPDATE
+			`, item.productID, businessID).Scan(&productID)
+
+			if errors.Is(err, pgx.ErrNoRows) {
+				c.JSON(http.StatusConflict, gin.H{
+					"error": "an order product is no longer available",
+				})
+				return
+			}
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "could not lock product"})
+				return
+			}
+		}
+
+		// Restore the quantities deducted during confirmation.
+		for _, item := range items {
+			tag, err := tx.Exec(ctx, `
+				UPDATE products
+				SET stock_quantity = stock_quantity + $1,
+				    updated_at = NOW()
+				WHERE id = $2 AND business_id = $3
+			`, item.quantity, item.productID, businessID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "could not restore product stock"})
+				return
+			}
+			if tag.RowsAffected() != 1 {
+				c.JSON(http.StatusConflict, gin.H{"error": "product stock restoration failed"})
+				return
+			}
+		}
+	}
+
+	// Preserve confirmed_at for previously confirmed orders.
+	var order orderResponse
+	err = tx.QueryRow(ctx, `
+		UPDATE orders
+		SET status = 'cancelled',
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND business_id = $2
+		  AND status = $3
+		RETURNING id::text, business_id::text, customer_id::text,
+		          order_number, status, total_kobo, COALESCE(notes, ''),
+		          confirmed_at::text, created_at::text, updated_at::text
+	`, orderID, businessID, status).Scan(
+		&order.ID, &order.BusinessID, &order.CustomerID,
+		&order.OrderNumber, &order.Status, &order.TotalKobo, &order.Notes,
+		&order.ConfirmedAt, &order.CreatedAt, &order.UpdatedAt,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not cancel order"})
+		return
+	}
+
+	// Load the order items for the response.
+	itemRows, err := tx.Query(ctx, `
+		SELECT id::text, product_id::text, product_name, quantity,
+		       unit_price_kobo, line_total_kobo
+		FROM order_items
+		WHERE order_id = $1
+		ORDER BY product_id
+	`, orderID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load cancelled order items"})
+		return
+	}
+
+	order.Items = make([]orderItemResponse, 0)
+	for itemRows.Next() {
+		var item orderItemResponse
+		if err := itemRows.Scan(
+			&item.ID, &item.ProductID, &item.ProductName,
+			&item.Quantity, &item.UnitPriceKobo, &item.LineTotalKobo,
+		); err != nil {
+			itemRows.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read cancelled order items"})
+			return
+		}
+		order.Items = append(order.Items, item)
+	}
+
+	itemRowsErr := itemRows.Err()
+	itemRows.Close()
+	if itemRowsErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read cancelled order items"})
+		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not save order cancellation"})
+		return
+	}
+
+	c.JSON(http.StatusOK, order)
+}
