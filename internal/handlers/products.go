@@ -272,5 +272,4 @@ func scanProduct(row productRow) (*productResponse, error) {
 	return &product, nil
 }
 
-// Keep strconv imported only if adding pagination later.
 var _ = strconv.IntSize

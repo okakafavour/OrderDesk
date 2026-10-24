@@ -451,7 +451,6 @@ func (h *OrdersHandler) List(c *gin.Context) {
 			return
 		}
 
-		// The list returns order summaries; items are available through Get.
 		order.Items = []orderItemResponse{}
 		orders = append(orders, order)
 	}
